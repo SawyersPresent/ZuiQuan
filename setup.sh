@@ -3,10 +3,8 @@
 # redirector-setup.sh
 # Universal C2 Redirector Setup — Apache | Nginx | Caddy | Dumb-Pipe
 # =============================================================================
-# Author:       Derived from ARTOC scripts (Stigs @White Knight Labs) +
-#               ARTOC knowledge base
-# Profiles:     Supports artoc_orginal_cs_profile and artoc_aws_cs_profile
-#               URI patterns baked in as presets (see PROFILE below)
+# Author:       Universal C2 redirector setup script
+# Profiles:     URI patterns baked in as presets (see PROFILE below)
 # Usage:
 #   sudo bash redirector-setup.sh
 #
@@ -34,7 +32,10 @@
 set -euo pipefail
 
 # =============================================================================
-# CONFIGURATION — edit this block before running
+# CONFIGURATION — optional pre-fill
+# You can set values here before running, OR leave them blank and the script
+# will prompt you interactively for everything. Pre-filled values become the
+# default shown in brackets at each prompt — press Enter to accept them.
 # =============================================================================
 
 # ---- Redirector type --------------------------------------------------------
@@ -43,8 +44,8 @@ SERVER_TYPE="apache"
 
 # ---- Profile preset ---------------------------------------------------------
 # Options:
-#   original   -> artoc_orginal_cs_profile   (jQuery / IIS spoof)
-#   cloudfront -> artoc_aws_cs_profile       (Google SafeBrowsing / CloudFront)
+#   original   -> Original profile   (jQuery / IIS spoof)
+#   cloudfront -> CloudFront profile (Google SafeBrowsing / CloudFront)
 #   custom     -> fill in C2_URI_GET / C2_URI_POST / SECRET_HEADER manually
 PROFILE="original"
 
@@ -84,13 +85,389 @@ error()   { echo -e "${RED}[-]${NC} $1"; exit 1; }
 section() { echo -e "\n${CYAN}==== $1 ====${NC}\n"; }
 
 # =============================================================================
+# INTERACTIVE SETUP
+# Prompts for every required value. Pre-filled config block values appear as
+# defaults in [brackets] — press Enter to accept, or type a new value.
+# Called at the start of main() before anything else runs.
+# =============================================================================
+interactive_setup() {
+    section "Interactive Configuration"
+
+    # Helper: prompt with a default value shown in brackets.
+    # Usage: _ask "Question text" VARNAME "default"
+    # If the user just presses Enter, the default is kept.
+    # If the var is already set (non-empty), the existing value is the default.
+    _ask() {
+        local prompt="$1" varname="$2" default="$3"
+        local current="${!varname:-$default}"
+        local input
+        if [[ -n "$current" ]]; then
+            read -rp "  ${prompt} [${current}]: " input
+            printf -v "$varname" '%s' "${input:-$current}"
+        else
+            read -rp "  ${prompt}: " input
+            while [[ -z "$input" ]]; do
+                warn "  This field is required."
+                read -rp "  ${prompt}: " input
+            done
+            printf -v "$varname" '%s' "$input"
+        fi
+    }
+
+    # Helper: numbered menu pick. Sets the named variable to the chosen value.
+    # Usage: _pick "Question" VARNAME val1 "label1" val2 "label2" ...
+    _pick() {
+        local prompt="$1" varname="$2"; shift 2
+        local -a vals labels
+        local i=0
+        while [[ $# -ge 2 ]]; do
+            vals+=("$1"); labels+=("$2"); shift 2; ((i++)) || true
+        done
+        local current="${!varname}"
+        echo ""
+        echo "  ${prompt}"
+        for j in "${!vals[@]}"; do
+            local marker="  "
+            [[ "${vals[$j]}" == "$current" ]] && marker="->"
+            printf "    %s %d) %s\n" "$marker" "$((j+1))" "${labels[$j]}"
+        done
+        echo ""
+        local choice
+        while true; do
+            read -rp "  Choose [1-${#vals[@]}] (current: ${current:-none}): " choice
+            # Accept empty = keep current
+            if [[ -z "$choice" && -n "$current" ]]; then
+                break
+            elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#vals[@]} )); then
+                printf -v "$varname" '%s' "${vals[$((choice-1))]}"
+                break
+            else
+                warn "  Enter a number between 1 and ${#vals[@]}, or press Enter to keep current."
+            fi
+        done
+    }
+
+    # -------------------------------------------------------------------------
+    # Step 1: Server type
+    # -------------------------------------------------------------------------
+    _pick "Redirector type:" SERVER_TYPE \
+        "apache"            "Apache   — full filtering, mod_rewrite, best red team support" \
+        "nginx"             "Nginx    — high-throughput, upstream failover to decoy" \
+        "caddy"             "Caddy    — automatic TLS, zero cert management" \
+        "dumbpipe-iptables" "iptables — dumb pipe, no filtering, instant standup" \
+        "dumbpipe-socat"    "socat    — dumb pipe, userspace, easy to restart"
+
+    echo ""
+    info "  Selected: ${SERVER_TYPE}"
+
+    # -------------------------------------------------------------------------
+    # Step 2: Malleable C2 profile preset
+    # -------------------------------------------------------------------------
+    # Only relevant for filtering servers — dumb pipes don't use URIs
+    if [[ "$SERVER_TYPE" != dumbpipe-* ]]; then
+        _pick "C2 profile preset:" PROFILE \
+            "original"   "Original   — jQuery URIs, Chrome UA, IIS spoof" \
+            "cloudfront" "CloudFront — Google SafeBrowsing URIs, IE11 UA" \
+            "custom"     "Custom     — enter your own URIs and header below"
+
+        echo ""
+        info "  Selected: ${PROFILE}"
+
+        # If custom, collect URI / header values now
+        if [[ "$PROFILE" == "custom" ]]; then
+            echo ""
+            _ask "GET URI  (e.g. /api/v1/health)"  C2_URI_GET   ""
+            _ask "POST URI (e.g. /api/v1/sync)"     C2_URI_POST  ""
+            _ask "Secret header name"               SECRET_HEADER_NAME "Access-X-Control"
+            _ask "Secret header value"              SECRET_HEADER_VAL  "True"
+        fi
+    fi
+
+    # -------------------------------------------------------------------------
+    # Step 3: Team server
+    # -------------------------------------------------------------------------
+    echo ""
+    _ask "Team server IP   (private IP, never exposed to internet)" TEAMSERVER_IP  ""
+    _ask "Team server port"                                          TEAMSERVER_PORT "443"
+
+    # -------------------------------------------------------------------------
+    # Step 4: Domain and cert (not needed for dumb-pipe)
+    # -------------------------------------------------------------------------
+    if [[ "$SERVER_TYPE" != dumbpipe-* ]]; then
+        echo ""
+        _ask "Redirector domain (e.g. updates-cdn.com)" DOMAIN ""
+
+        _pick "TLS certificate mode:" CERT_MODE \
+            "letsencrypt" "Let's Encrypt — free, automated, requires port 80 open + DNS pointing here" \
+            "selfsigned"  "Self-signed   — no DNS needed, beacons ignore cert warnings" \
+            "manual"      "Manual        — you supply cert and key paths"
+
+        if [[ "$CERT_MODE" == "manual" ]]; then
+            echo ""
+            _ask "Path to certificate file (.crt / fullchain.pem)" CERT_CRT ""
+            _ask "Path to private key file (.key / privkey.pem)"   CERT_KEY ""
+        fi
+    fi
+
+    # -------------------------------------------------------------------------
+    # Step 5: Decoy URL
+    # -------------------------------------------------------------------------
+    echo ""
+    _ask "Decoy URL (non-matching traffic is silently redirected here)" \
+         DECOY_URL "https://www.microsoft.com"
+
+    # -------------------------------------------------------------------------
+    # Step 6: Confirmation summary
+    # -------------------------------------------------------------------------
+    echo ""
+    echo "  ┌─────────────────────────────────────────────────────────┐"
+    echo "  │  Configuration summary                                  │"
+    echo "  ├─────────────────────────────────────────────────────────┤"
+    printf "  │  %-20s %-35s│\n" "Server type:"    "$SERVER_TYPE"
+    printf "  │  %-20s %-35s│\n" "Team server:"    "${TEAMSERVER_IP}:${TEAMSERVER_PORT}"
+    if [[ "$SERVER_TYPE" != dumbpipe-* ]]; then
+        printf "  │  %-20s %-35s│\n" "Profile:"    "$PROFILE"
+        printf "  │  %-20s %-35s│\n" "Domain:"     "$DOMAIN"
+        printf "  │  %-20s %-35s│\n" "Cert mode:"  "$CERT_MODE"
+    fi
+    printf "  │  %-20s %-35s│\n" "Decoy:"          "$DECOY_URL"
+    echo "  └─────────────────────────────────────────────────────────┘"
+    echo ""
+
+    local confirm
+    read -rp "  Proceed with this configuration? [Y/n] " confirm
+    [[ "${confirm,,}" == "n" ]] && error "Aborted by user."
+    echo ""
+}
+
+
+# =============================================================================
+# EXISTING SOFTWARE DETECTION
+# Runs before any install. Reports what is already present, what version,
+# and whether it is actively running. Handles three states per package:
+#   not installed  -> nothing to do, fresh install will proceed normally
+#   installed+running -> already active, we will reconfigure it in place
+#   installed+stopped -> present but not running, we will start it after config
+#
+# Also checks for conflicting web servers that would fight for port 80/443.
+# A conflict is when you chose apache but nginx is already running (or vice
+# versa). The script warns and asks before proceeding — it will NOT silently
+# kill a running service on your host.
+# =============================================================================
+detect_existing() {
+    section "Existing software detection"
+
+    # ---- Helper: check one package ------------------------------------------
+    # Usage: _check_pkg <display_name> <binary_or_command> <service_name>
+    # Prints one status line. Sets global _PKG_STATE to:
+    #   "missing"  | "installed_stopped" | "installed_running"
+    _check_pkg() {
+        local display="$1" cmd="$2" svc="$3"
+        if command -v "$cmd" &>/dev/null; then
+            local ver
+            ver="$("$cmd" --version 2>&1 | head -1)" || ver="(version unknown)"
+            if systemctl is-active --quiet "$svc" 2>/dev/null; then
+                info  "  ${display}: already installed and RUNNING   [${ver}]"
+                _PKG_STATE="installed_running"
+            else
+                warn  "  ${display}: installed but NOT running        [${ver}]"
+                _PKG_STATE="installed_stopped"
+            fi
+        else
+            echo -e "  ${display}: not installed"
+            _PKG_STATE="missing"
+        fi
+    }
+
+    # ---- Helper: check a conflicting web server -----------------------------
+    # If the operator chose SERVER_TYPE=apache but nginx is running (or vice
+    # versa), that is a conflict. Warn and ask for explicit confirmation.
+    _conflict_check() {
+        local chosen="$1" rival="$2" rival_svc="$3"
+        if [[ "$SERVER_TYPE" == "$chosen" ]]; then
+            if systemctl is-active --quiet "$rival_svc" 2>/dev/null; then
+                echo ""
+                warn "CONFLICT: You chose SERVER_TYPE=${chosen} but ${rival} is currently running."
+                warn "Both servers bind port 80 and 443. Running both will cause a port conflict."
+                warn "This script will stop ${rival} before starting ${chosen}."
+                echo ""
+                read -rp "  Continue and stop ${rival}? [y/N] " _ans
+                [[ "${_ans,,}" == "y" ]] || error "Aborted by user. Stop ${rival} manually first: systemctl stop ${rival_svc}"
+                systemctl stop "$rival_svc" || true
+                info "${rival} stopped."
+            fi
+        fi
+    }
+
+    echo ""
+    echo "  Checking for target web server and dependencies..."
+    echo ""
+
+    # ---- Target web server --------------------------------------------------
+    case "$SERVER_TYPE" in
+        apache)
+            _check_pkg "Apache2"   "apache2"  "apache2"
+            APACHE_STATE="$_PKG_STATE"
+
+            # Conflict check: nginx or caddy running alongside apache
+            _conflict_check "apache" "nginx" "nginx"
+            _conflict_check "apache" "caddy" "caddy"
+
+            # Report active sites if already installed
+            if [[ "$APACHE_STATE" != "missing" ]]; then
+                echo ""
+                info "  Active Apache sites:"
+                ls /etc/apache2/sites-enabled/ 2>/dev/null | sed 's/^/    /' || echo "    (none)"
+                info "  Active Apache modules (relevant):"
+                apache2ctl -M 2>/dev/null \
+                    | grep -E 'proxy|rewrite|ssl|deflate|security|php|headers' \
+                    | sed 's/^/    /' || echo "    (could not query)"
+                echo ""
+                warn "  Apache is already installed. This script will reconfigure it in place."
+                warn "  Existing site configs in sites-available/ will NOT be deleted."
+                warn "  Only ${DOMAIN}-redir.conf will be created/overwritten."
+            fi
+            ;;
+
+        nginx)
+            _check_pkg "Nginx"     "nginx"    "nginx"
+            NGINX_STATE="$_PKG_STATE"
+
+            _conflict_check "nginx" "apache" "apache2"
+            _conflict_check "nginx" "caddy"  "caddy"
+
+            if [[ "$NGINX_STATE" != "missing" ]]; then
+                echo ""
+                info "  Active Nginx sites:"
+                ls /etc/nginx/sites-enabled/ 2>/dev/null | sed 's/^/    /' || echo "    (none)"
+                echo ""
+                warn "  Nginx is already installed. This script will reconfigure it in place."
+                warn "  Only /etc/nginx/sites-available/c2-redirector will be created/overwritten."
+            fi
+            ;;
+
+        caddy)
+            _check_pkg "Caddy"     "caddy"    "caddy"
+            CADDY_STATE="$_PKG_STATE"
+
+            _conflict_check "caddy" "apache" "apache2"
+            _conflict_check "caddy" "nginx"  "nginx"
+
+            if [[ "$CADDY_STATE" != "missing" ]]; then
+                echo ""
+                warn "  Caddy is already installed. The existing /etc/caddy/Caddyfile will be overwritten."
+                info "  Caddy version: $(caddy version 2>/dev/null || echo unknown)"
+            fi
+            ;;
+
+        dumbpipe-iptables)
+            # iptables is always present on Linux; check if NAT rules already exist
+            echo ""
+            if iptables -t nat -L PREROUTING -n 2>/dev/null | grep -q DNAT; then
+                warn "  Existing iptables DNAT rules detected:"
+                iptables -t nat -L PREROUTING -n --line-numbers 2>/dev/null | grep DNAT | sed 's/^/    /'
+                warn "  New rules will be ADDED on top of these. Run 'iptables -t nat -F' first if you want a clean slate."
+            else
+                info "  iptables: no existing DNAT rules found — clean slate."
+            fi
+
+            # Check if IP forwarding is already on
+            if [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" == "1" ]]; then
+                info "  ip_forward: already enabled."
+            else
+                echo "  ip_forward: currently disabled — will be enabled."
+            fi
+            ;;
+
+        dumbpipe-socat)
+            _check_pkg "socat" "socat" "c2-redir-443"
+            SOCAT_STATE="$_PKG_STATE"
+
+            # Check if our own socat services already exist
+            if systemctl cat c2-redir-443 &>/dev/null; then
+                warn "  socat systemd unit c2-redir-443 already exists."
+                warn "  It will be stopped, overwritten, and restarted."
+                systemctl stop c2-redir-443 c2-redir-80 2>/dev/null || true
+            fi
+            ;;
+    esac
+
+    # ---- Shared dependencies -------------------------------------------------
+    echo ""
+    echo "  Checking shared dependencies..."
+    echo ""
+
+    # openssl — needed for self-signed certs
+    if command -v openssl &>/dev/null; then
+        info "  openssl:  $(openssl version)"
+    else
+        echo "  openssl:  not installed — will be installed"
+    fi
+
+    # curl — needed for tests and Caddy GPG fetch
+    if command -v curl &>/dev/null; then
+        info "  curl:     $(curl --version | head -1)"
+    else
+        echo "  curl:     not installed — will be installed"
+    fi
+
+    # certbot — only needed for letsencrypt mode
+    if [[ "$CERT_MODE" == "letsencrypt" ]]; then
+        if command -v certbot &>/dev/null; then
+            local _cb_ver
+            _cb_ver="$(certbot --version 2>&1 | head -1)"
+            # Check if a cert for this domain already exists
+            if [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
+                info "  certbot:  ${_cb_ver}"
+                info "  LE cert:  /etc/letsencrypt/live/${DOMAIN}/ already exists — will reuse."
+                # Surface expiry so operator knows if renewal is needed
+                local _exp
+                _exp="$(openssl x509 -enddate -noout \
+                    -in "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" 2>/dev/null \
+                    | cut -d= -f2)" || _exp="(could not read)"
+                info "  LE cert expiry: ${_exp}"
+                # Tell setup_cert to skip the certbot run and just set the paths
+                LE_CERT_EXISTS="true"
+            else
+                info "  certbot:  ${_cb_ver} — cert for ${DOMAIN} not yet obtained"
+                LE_CERT_EXISTS="false"
+            fi
+        else
+            echo "  certbot:  not installed — will be installed"
+            LE_CERT_EXISTS="false"
+        fi
+    fi
+
+    # socat — check for dumbpipe-socat regardless of SERVER_TYPE
+    # (operators sometimes run socat alongside a filtering redirector for DNS)
+    if [[ "$SERVER_TYPE" == "dumbpipe-socat" ]] && ! command -v socat &>/dev/null; then
+        echo "  socat:    not installed — will be installed"
+    fi
+
+    # ModSecurity — only relevant for apache
+    if [[ "$SERVER_TYPE" == "apache" ]]; then
+        if dpkg -l libapache2-mod-security2 &>/dev/null 2>&1 \
+            && dpkg -l libapache2-mod-security2 | grep -q '^ii'; then
+            info "  ModSecurity (libapache2-mod-security2): already installed"
+        else
+            echo "  ModSecurity (libapache2-mod-security2): not installed — will be installed"
+        fi
+    fi
+
+    echo ""
+    info "Detection complete. Proceeding with setup in 3 seconds..."
+    sleep 3
+}
+
+
+# =============================================================================
 # PROFILE RESOLUTION
 # Apply URI / header / UA values from the chosen Malleable C2 profile preset
 # =============================================================================
 resolve_profile() {
     case "$PROFILE" in
         original)
-            # artoc_orginal_cs_profile
+            # Original profile
             # GET:  /jquery/user/preferences
             # POST: /api/v2/jquery/settings/update
             # Custom header: Access-X-Control: True
@@ -100,13 +477,13 @@ resolve_profile() {
             SECRET_HEADER_NAME="Access-X-Control"
             SECRET_HEADER_VAL="True"
             BEACON_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
-            info "Profile: ARTOC Original (jQuery / IIS spoof)"
+            info "Profile: Original (jQuery / IIS spoof)"
             ;;
         cloudfront)
-            # artoc_aws_cs_profile
+            # CloudFront profile
             # GET:  /safebrowsing/fp/kwL-HS0nl2B4g7pX4zQXYXrkrPsNBtN82S4PNYo
             # POST: /safebrowsing/fp/PQA-7OXETIzzxqT2Sxx1
-            # NOTE: the original profile file has trailing spaces on these URIs — stripped here.
+            # NOTE: trailing spaces on these URIs stripped here.
             # Custom header: Access-X-Control: True
             # UA: IE11 / Trident
             C2_URI_GET="/safebrowsing/fp/kwL-HS0nl2B4g7pX4zQXYXrkrPsNBtN82S4PNYo"
@@ -114,7 +491,7 @@ resolve_profile() {
             SECRET_HEADER_NAME="Access-X-Control"
             SECRET_HEADER_VAL="True"
             BEACON_UA="Mozilla/5.0 (Windows NT 6.3; Win64; x64; Trident/7.0; TNJB; MSAppHost/2.0; rv:11.0) like Gecko"
-            info "Profile: ARTOC AWS CloudFront (SafeBrowsing / CloudFront)"
+            info "Profile: CloudFront (SafeBrowsing / CloudFront)"
             ;;
         custom)
             # Values come from the CONFIGURATION block above
@@ -252,14 +629,20 @@ setup_cert() {
 
 # =============================================================================
 # APACHE SETUP
-# Learned from: ARTOC server-setup.sh + domain-setup.sh + skill reference
-# Adds: mod_security, IIS spoofing, 4-layer filter, ARTOC profile URIs
+# Adds: mod_security, IIS spoofing, 4-layer filter
 # =============================================================================
 setup_apache() {
     section "Apache mod_rewrite Redirector"
 
     # -- Install ---------------------------------------------------------------
-    info "Installing Apache and modules..."
+    # apt-get install is idempotent: if a package is already installed,
+    # apt skips it. We still run update -qq to refresh the package index
+    # so that any newly installed packages get current versions.
+    if command -v apache2 &>/dev/null; then
+        info "Apache already installed — skipping package install, reconfiguring in place."
+    else
+        info "Installing Apache and modules..."
+    fi
     apt-get update -qq
     apt-get install -y apache2 libapache2-mod-security2 curl openssl
 
@@ -467,7 +850,11 @@ APACHE_EOF
 setup_nginx() {
     section "Nginx Redirector"
 
-    info "Installing nginx..."
+    if command -v nginx &>/dev/null; then
+        info "Nginx already installed ($(nginx -v 2>&1 | head -1)) — reconfiguring in place."
+    else
+        info "Installing nginx..."
+    fi
     apt-get update -qq
     apt-get install -y nginx libnginx-mod-http-headers-more-filter curl openssl
 
@@ -508,7 +895,7 @@ server {
     ssl_protocols       TLSv1.2 TLSv1.3;
     ssl_ciphers         HIGH:!aNULL:!MD5;
 
-    # Hide nginx version; spoof as IIS (ARTOC pattern)
+    # Hide nginx version; spoof as IIS
     server_tokens off;
     more_set_headers "Server: Microsoft-IIS/10.0";
     more_clear_headers "X-Powered-By";
@@ -597,13 +984,16 @@ NGINX_EOF
 setup_caddy() {
     section "Caddy Redirector (Auto-TLS)"
 
-    info "Installing Caddy..."
-    apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-        | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
-        | tee /etc/apt/sources.list.d/caddy-stable.list
-    apt-get update -qq && apt-get install -y caddy
+    if command -v caddy &>/dev/null; then
+        info "Caddy already installed ($(caddy version 2>/dev/null | head -1)) — reconfiguring in place."
+        info "Skipping Caddy repo add and package install."
+    else
+        info "Installing Caddy from official repo..."
+        apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
+        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key'             | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt'             | tee /etc/apt/sources.list.d/caddy-stable.list
+        apt-get update -qq && apt-get install -y caddy
+    fi
 
     mkdir -p /var/log/caddy
     chown caddy:caddy /var/log/caddy 2>/dev/null || true
@@ -620,7 +1010,7 @@ setup_caddy() {
 
 ${DOMAIN} {
 
-    # Spoof server identity as IIS (ARTOC pattern)
+    # Spoof server identity as IIS
     header Server "Microsoft-IIS/10.0"
     header -X-Powered-By
 
@@ -734,8 +1124,13 @@ setup_dumbpipe_iptables() {
     iptables -P FORWARD ACCEPT
 
     # Persist rules across reboots
-    apt-get install -y iptables-persistent 2>/dev/null || true
     mkdir -p /etc/iptables
+    if ! dpkg -l iptables-persistent 2>/dev/null | grep -q '^ii'; then
+        info "Installing iptables-persistent for rule persistence across reboots..."
+        apt-get install -y iptables-persistent 2>/dev/null || true
+    else
+        info "iptables-persistent already installed — saving rules."
+    fi
     netfilter-persistent save 2>/dev/null || iptables-save > /etc/iptables/rules.v4
 
     info "iptables rules set. ALL traffic on :443 and :80 is forwarded to ${TEAMSERVER_IP}:${TEAMSERVER_PORT}"
@@ -756,8 +1151,13 @@ setup_dumbpipe_iptables() {
 setup_dumbpipe_socat() {
     section "Dumb-Pipe Redirector (socat)"
 
-    apt-get update -qq
-    apt-get install -y socat screen
+    if command -v socat &>/dev/null; then
+        info "socat already installed ($(socat -V 2>&1 | grep -i socat | head -1)) — skipping package install."
+    else
+        info "Installing socat..."
+        apt-get update -qq
+        apt-get install -y socat screen
+    fi
 
     info "Writing socat systemd service..."
     cat > /etc/systemd/system/c2-redir-443.service << SERVICE_EOF
@@ -807,7 +1207,7 @@ SERVICE_EOF
 
 # =============================================================================
 # HOST HARDENING
-# SSH key-only auth + minimal firewall — same pattern as ARTOC server-setup.sh
+# SSH key-only auth + minimal firewall
 # =============================================================================
 harden() {
     section "Host Hardening"
@@ -878,13 +1278,17 @@ main() {
     echo ""
     echo "============================================================"
     echo "   Universal C2 Redirector Setup"
-    echo "   ARTOC // Derived from White Knight Labs infrastructure"
     echo "============================================================"
     echo ""
 
-    # Resolve profile URIs before pre-flight so they print in summary
+    # interactive_setup() prompts for all required values first.
+    # Any values already set in the config block become the shown default.
+    interactive_setup
+
+    # Resolve profile URIs (reads vars set by interactive_setup)
     resolve_profile
     preflight
+    detect_existing
 
     case "$SERVER_TYPE" in
         apache)
